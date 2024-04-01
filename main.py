@@ -2,6 +2,7 @@
 # https://github.com/agners/micropython-scd30
 
 import network, usocket, ustruct, utime, machine
+import ntptime
 import time
 from machine import I2C, Pin
 from time import sleep
@@ -31,6 +32,8 @@ led = Pin(13, Pin.OUT)
 #red = Pin(25, Pin.OUT)
 #green = Pin(17, Pin.OUT)
 #blue = Pin(18, Pin.OUT)
+kwhA = 0.0
+kwhB = 0.0
 
 # data is collected to this
 data = {}
@@ -48,9 +51,12 @@ data = {}
 #     }
 
 infos = {
-    "power": [ "Power", "power", "w" ],
-    "start_time": [ "Startup time", None, None ],
-    "heartbeat": [ "Heartbeat", None, None ]
+    "powerA": [ "Pajan sähköteho", "power", "W", None ],
+    "powerB": [ "Autojen sähköteho", "power", "W", None ],
+    "energyA": [ "Pajan sähkönkulutus", "energy", "kWh", "total_increasing" ],
+    "energyB": [ "Autojen sähkönkulutus", "energy", "kWh", "total_increasing" ],
+    "start_time": [ "Käynnistynyt", None, None, None ],
+    "heartbeat": [ "Viimeisin viesti", None, None, None ]
     }
 #    "start_time": [ "Startup time", "timestamp", "timestamp" ],
 #    "heartbeat": [ "Heartbeat", "timestamp", "timestamp" ]
@@ -121,9 +127,12 @@ def connect_wifi():
             while wlan.isconnected() == False:
                 cnt = cnt + 1
                 print(".", end='')
+                led_off()
                 time.sleep_ms(100)
                 if (usewdt):
                     wdt.feed()
+                led_on()
+                time.sleep_ms(100)
 
                 if (cnt>100):
                     print("no response for 10sec, bailout waiting")
@@ -144,8 +153,21 @@ def connect_wifi():
             #if (tryagain>5):
             #    restart_and_reconnect()
     
-
 def ntp():
+    global data
+    global wdt
+    global usewdt
+    
+    if (usewdt):
+        wdt.feed()
+
+    print("Local time before synchronization：%s" %str(time.localtime()))
+    ntptime.timeout = 10
+    ntptime.settime()
+    print("Local time after synchronization：%s" %str(time.localtime()))
+    data['start_time'] = str(time.localtime())
+
+def ntpOld():
     global data
     global wdt
     global usewdt
@@ -225,34 +247,57 @@ def restart_and_reconnect():
 
 
 # Initialize the impulse counter and the last measurement time
-impulse_counter = 0
-last_measurement_time = utime.ticks_ms()
+impulse_counterA = 0
+last_measurement_timeA = utime.ticks_ms()
+impulse_counterB = 0
+last_measurement_timeB = utime.ticks_ms()
 
 # This function will be called every time an impulse is detected
-def handle_impulse(pin):
-    global impulse_counter
-    impulse_counter += 1
-    print("Impulse detected")
+def handle_impulseA(pin):
+    global impulse_counterA
+    impulse_counterA += 1
+    print("Impulse A detected")
+
+# This function will be called every time an impulse is detected
+def handle_impulseB(pin):
+    global impulse_counterB
+    impulse_counterB += 1
+    print("Impulse B detected")
 
 # Set up the pin connected to the electricity meter to call handle_impulse on the rising edge
-impulse_pin = Pin('D13', mode=Pin.IN, pull=Pin.PULL_UP)  # Replace 'P10' with the correct pin
-impulse_pin.irq(trigger=Pin.IRQ_RISING, handler=handle_impulse)
+impulse_pinA = Pin('D12', mode=Pin.IN, pull=Pin.PULL_UP)  # Replace 'P10' with the correct pin
+impulse_pinA.irq(trigger=Pin.IRQ_RISING, handler=handle_impulseA)
 
+# Set up the pin connected to the electricity meter to call handle_impulse on the rising edge
+impulse_pinB = Pin('D10', mode=Pin.IN, pull=Pin.PULL_UP)  # Replace 'P10' with the correct pin
+impulse_pinB.irq(trigger=Pin.IRQ_RISING, handler=handle_impulseB)
 
 # main program starts here
 
 def main():
-    global impulse_counter
-    global last_measurement_time
+    global impulse_counterA
+    global last_measurement_timeA
+    global impulse_counterB
+    global last_measurement_timeB
     global message_interval
     global last_message
     global data
     global client_id, mqtt_server, topic_sub, topic_pub
     global wdt
     global usewdt
-    
+    global config
+    global kwhA
+    global kwhB
+
+    print("Led ON")
+    led_on()
+    sleep(1)
+    print("Led OFF")
+    led_off()
+    sleep(1)
+
     # shall we use watchdog ?
-    usewdt = False
+    usewdt = True
     
     if (usewdt):
         wdt = WDT(timeout=8000)  # enable it with a timeout of 8s
@@ -269,13 +314,16 @@ def main():
     print("Getting date and time")
     ntp()
     print("NTP OK")
-    
-    pwr = 0
+    data['heartbeat'] = time.localtime()
+    if (usewdt):
+        wdt.feed()
 
     startup_time = time.time()
     reset_when_up_more_than_seconds = 60 * 10 #* 4 # 4h reset interval
-    impulse_counter = 0
-    last_measurement_time = utime.ticks_ms()
+    impulse_counterA = 0
+    last_measurement_timeA = utime.ticks_ms()
+    impulse_counterB = 0
+    last_measurement_timeB = utime.ticks_ms()
 
     while True:
       try:
@@ -288,28 +336,59 @@ def main():
         #    restart_and_reconnect()
             
         if since_last_message > message_interval:
+          if (usewdt):
+            wdt.feed()
 
-          timestamp = utime.localtime()
-          data['heartbeat'] = format_time_to_iso(timestamp)
+          #timestamp = utime.localtime()
+          data['heartbeat'] = time.localtime()
 
           # Calculate the time difference in hours since the last measurement
-          time_diff = utime.ticks_diff(utime.ticks_ms(), last_measurement_time) / (60 * 60 * 1000)
+          time_diffA = utime.ticks_diff(utime.ticks_ms(), last_measurement_timeA) / (60 * 60 * 1000)
 
           #if time_diff >= 0:  # If at least one hour has passed
           # Calculate the power in kilowatts
-          print("Time diff: %.2f h" % time_diff)
-          print("Impulse counter: %d" % impulse_counter)
-          print("Last measurement time: %d" % last_measurement_time)
+          print("Time diff A: %.2f h" % time_diffA)
+          print("Impulse counter A: %d" % impulse_counterA)
+          print("Last measurement time: %d" % last_measurement_timeA)
           print("Current time: %d" % utime.ticks_ms())
           pulses_per_kwh = 1000  # Number of impulses per kilowatt-hour
-          power = round(impulse_counter / (pulses_per_kwh * time_diff) * 1000, 0)  # Power in watts
-          data['power'] = power
-          print("Power: %.0f W" % power)
+          powerA = round(impulse_counterA / (pulses_per_kwh * time_diffA) * 1000, 2)  # Power in watts
+          data['powerA'] = powerA
+          print("Power A: %.0f W" % powerA)
 
           # Reset the impulse counter and the last measurement time
-          impulse_counter = 0
-          last_measurement_time = utime.ticks_ms()
+          impulse_counterA = 0
+          last_measurement_timeA = utime.ticks_ms()
 
+          # Calculate the time difference in hours since the last measurement
+          time_diffB = utime.ticks_diff(utime.ticks_ms(), last_measurement_timeB) / (60 * 60 * 1000)
+
+          #if time_diff >= 0:  # If at least one hour has passed
+          # Calculate the power in kilowatts
+          print("Time diff B: %.2f h" % time_diffB)
+          print("Impulse counter B: %d" % impulse_counterB)
+          print("Last measurement time: %d" % last_measurement_timeB)
+          print("Current time: %d" % utime.ticks_ms())
+          pulses_per_kwh = 1000  # Number of impulses per kilowatt-hour
+          powerB = round(impulse_counterB / (pulses_per_kwh * time_diffB) * 1000, 2)  # Power in watts
+          data['powerB'] = powerB
+          print("Power B: %.0f W" % powerB)
+
+          # Reset the impulse counter and the last measurement time
+          impulse_counterB = 0
+          last_measurement_timeB = utime.ticks_ms()
+
+          # Calculate the energy consumption in kilowatt-hours
+          kwhAnew = powerA * time_diffA / 1000  # Energy consumption in kilowatt-hours
+          kwhBnew = powerB * time_diffB / 1000  # Energy consumption in kilowatt-hours
+          kwhA = kwhA + kwhAnew
+          kwhB = kwhB + kwhBnew
+          
+          print("Energy A: %.5f kWh" % kwhA)
+          print("Energy B: %.5f kWh" % kwhB)
+
+          data['energyA'] = kwhA
+          data['energyB'] = kwhB
 
           #read_bme680()
           #read_scd30()
@@ -318,7 +397,9 @@ def main():
           #wdt.feed()
 
           for key in data:
-             print("inside loop")
+             if (usewdt):
+               wdt.feed()
+
              #topic_id = b'#%s_#%s' % (str(key), str(client_id))
              print("Key {}".format(key))
 
@@ -326,6 +407,7 @@ def main():
              nimi = info[0]
              devclass = info[1]
              unitofmeasurement = info[2]
+             state_class = info[3]
              
              uid = str(client_id) + "_" + str(key)
 
@@ -340,9 +422,9 @@ def main():
                  topic_discovery = "homeassistant/sensor/" + str(client_id) + "_" + str(key) + "/config"
                  #"unique_id": ha_id,
                  # $ mosquitto_pub -t "homeassistant/sensor/abc/config" -m '{"state_topic": "homeassistant/sensor/abc/state", "value_template": "{{ value_json.temperature}}", "name": "temp sensor"}'
-                 devpl = { "name": "ElectricityCountMeter",
+                 devpl = { "name": config.device_name,
                          "identifiers": client_id,
-                         "manufacturer": "DIY"
+                         "manufacturer": config.manufacturer
                          }
                  
                  devplj = json.dumps(devpl).encode('utf-8')
@@ -364,7 +446,11 @@ def main():
                  if devclass == None:
                      msg = b'{ "dev": '+ devplj +', "unique_id": "'+ uid +'", "state_topic": "' + topic_id + '", "value_template": "{{ value_json.value }}", "name": "'+ nimi +'"}'
                  else:
-                     msg = b'{ "dev": '+ devplj +', "unique_id": "'+ uid +'", "unit_of_measurement": "'+ unitofmeasurement + '", "device_class": "'+ devclass +'", "state_topic": "' + topic_id + '", "value_template": "{{ value_json.value }}", "name": "'+ nimi +'"}'
+                     # energiamittareissa total_increasing esim.
+                     if state_class != None:
+                         msg = b'{ "dev": '+ devplj +', "unique_id": "'+ uid +'", "unit_of_measurement": "'+ unitofmeasurement + '", "device_class": "'+ devclass +'", "state_topic": "' + topic_id + '", "value_template": "{{ value_json.value }}", "name": "'+ nimi +'", "state_class": "'+ state_class +'"}'
+                     else:
+                         msg = b'{ "dev": '+ devplj +', "unique_id": "'+ uid +'", "unit_of_measurement": "'+ unitofmeasurement + '", "device_class": "'+ devclass +'", "state_topic": "' + topic_id + '", "value_template": "{{ value_json.value }}", "name": "'+ nimi +'"}'
                  #msg = b'{ "dev": '+ devplj +', "unique_id": "'+ uid +'", "unit_of_measurement": "'+ unitofmeasurement + '", "device_class": "'+ devclass +'", "state_topic": "' + topic_id + '", "name": "'+ nimi +'"}'
                  client.publish(topic_discovery, msg)
                  discovery_topics_sent[nimi] = True
@@ -374,7 +460,10 @@ def main():
     #      state_topic: "scd_co2/50159300689c611c"
     #      unit_of_measurement: "ppm"
     #      value_template: "{{ value_json }}"
-             msg = b'{ "value": "'+ str(data[key]) + '"}'
+             if key == "start_time" or key == "heartbeat":
+                msg = b'{ "value": "'+ str(data[key]) + '"}'
+             else:
+                msg = b'{ "value": %.1f}' % data[key]
              print("Sending JSON mqtt message {} {}".format(topic_id, msg))
              client.publish(topic_id, msg)
              #if key == "start_time" or key == "heartbeat":
